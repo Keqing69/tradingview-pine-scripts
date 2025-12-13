@@ -1,0 +1,16 @@
+# Operating System Files
+.DS_Store
+Thumbs.db
+*.swp
+
+# Editor Directories (VS Code, JetBrains)
+.vscode/
+.idea/
+
+# Local TradingView Backups or CSV Data
+*.backup
+*.csv
+*.log
+
+# Node modules (only if you ever use JS/TS based testing tools later)
+node_modules/
