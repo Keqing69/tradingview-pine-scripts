@@ -1,0 +1,150 @@
+//@version=5
+strategy("NAS100 Scalper [Nico] - FINAL BUNDLE", overlay=true, initial_capital=50000, currency=currency.USD, commission_type=strategy.commission.cash_per_contract, commission_value=0.5, slippage=2, max_bars_back=500)
+
+// ==========================================
+// 1. INPUTS & CONFIGURATION
+// ==========================================
+
+// --- RISK MANAGEMENT ---
+grp_risk = "1. Risk Management (Strikt)"
+riskPerTrade    = input.float(0.5, "Risk % per Trade (Fixed)", step=0.1, group=grp_risk) / 100
+rrRatio         = input.float(2.0, "Reward to Risk (Target 1.0%)", group=grp_risk)
+maxStopPoints   = input.float(40.0, "Max Stop Loss Distance (Points)", group=grp_risk, tooltip="Wenn Stop > 40 Pkt, Trade ignorieren (Ziel wäre zu weit weg).")
+
+// --- BROKER SPECS (NAS100) ---
+grp_spec = "2. Broker Specs (Real vs TV)"
+// WICHTIG: Dein Broker hat Contract Size 10. TV rechnet standardmäßig 1.
+// Wir lassen TV auf 1 (für korrekte P&L Anzeige) und rechnen die Lots für dich um.
+brokerContract  = input.float(10.0, "Contract Size (Broker)", group=grp_spec)
+minLotSize      = input.float(0.01, "Min Lot Size", group=grp_spec)
+tvPointVal      = 1.0 // Fix für TradingView Calculation
+
+// --- SESSION & ZEIT ---
+grp_time = "3. Session (NY Time)"
+startHour       = input.int(9, "Start Hour", group=grp_time)
+startMin        = input.int(30, "Start Minute", group=grp_time)
+endHour         = input.int(15, "End Hour", group=grp_time)
+endMin          = input.int(30, "End Minute", group=grp_time)
+useLunchFilter  = input.bool(true, "Skip Lunch (12:00-13:30)", group=grp_time)
+
+// --- STRATEGIE LOGIK ---
+grp_strat = "4. Strategy Logic"
+pivLen          = input.int(10, "Liquidity Lookback (Bars)", group=grp_strat)
+atrLen          = input.int(14, "ATR Length", group=grp_strat)
+minAtrVal       = input.float(2.0, "Min Volatility (ATR Pkt)", group=grp_strat)
+fvgEntryPct     = input.float(0.5, "FVG Entry (0.5 = 50%)", group=grp_strat)
+
+// --- BACKTEST ZEITRAUM ---
+grp_bt = "5. Backtest Range"
+startDate       = input.time(timestamp("1 Jan 2024"), "Start Date", group=grp_bt)
+endDate         = input.time(timestamp("1 Jan 2030"), "End Date", group=grp_bt)
+
+// ==========================================
+// 2. BERECHNUNGEN
+// ==========================================
+
+// Session Logic
+inTradeSession = true
+t = time(timeframe.period, "0930-1600:12345", "America/New_York")
+if useLunchFilter
+    if not na(time(timeframe.period, "1200-1330:12345", "America/New_York"))
+        inTradeSession := false
+if na(t)
+    inTradeSession := false
+
+// Date Filter
+inDateRange = time >= startDate and time <= endDate
+
+// Volatilität
+atrValue = ta.atr(atrLen)
+isVolatile = atrValue >= minAtrVal
+
+// Liquidity Levels (Pivots)
+ph = ta.pivothigh(high, pivLen, pivLen)
+pl = ta.pivotlow(low, pivLen, pivLen)
+var float lastLiqHigh = na
+var float lastLiqLow = na
+if not na(ph)
+    lastLiqHigh := ph
+if not na(pl)
+    lastLiqLow := pl
+
+// Circuit Breaker (Daily Loss Limit 3%)
+var float startDayEq = 0.0
+if dayofmonth(time) != dayofmonth(time[1])
+    startDayEq := strategy.equity
+dailyStopHit = ((strategy.equity - startDayEq) / startDayEq) <= -0.03
+
+// ==========================================
+// 3. SETUP & TRIGGER
+// ==========================================
+
+// Patterns
+sweepHigh = high > lastLiqHigh and close < lastLiqHigh 
+sweepLow  = low < lastLiqLow and close > lastLiqLow   
+
+// Displacement: Body muss > 60% der Range sein & Volatilität muss da sein
+bodySize = math.abs(close - open)
+rangeSize = high - low
+isDisplacement = bodySize > (rangeSize * 0.6) and isVolatile
+
+// FVG Detection
+bearishFVG = low[2] > high[0] and close[1] < open[1] 
+bullishFVG = high[2] < low[0] and close[1] > open[1] 
+
+// Validierung
+validShort = sweepHigh[1] and isDisplacement[0] and bearishFVG and inTradeSession and not dailyStopHit and inDateRange
+validLong  = sweepLow[1]  and isDisplacement[0] and bullishFVG and inTradeSession and not dailyStopHit and inDateRange
+
+// ==========================================
+// 4. EXECUTION (MIT REAL LOT BERECHNUNG)
+// ==========================================
+
+// Entry Prices (Limit Orders im FVG)
+shortEntryPrice = high[0] + ((low[2] - high[0]) * fvgEntryPct)
+longEntryPrice  = low[0] - ((low[0] - high[2]) * fvgEntryPct)
+
+// --- LONG EXECUTION ---
+if validLong and strategy.position_size == 0
+    float stopLevel = low[1] - syminfo.mintick * 20 // Buffer 20 Ticks
+    float stopDist = longEntryPrice - stopLevel
+    
+    // SKIP Trade wenn Stop zu weit weg (Ziel unrealistisch)
+    if stopDist <= maxStopPoints and stopDist > 0
+        // Berechnung für TradingView (Damit P&L Kurve stimmt)
+        float riskAmt = strategy.equity * riskPerTrade
+        float tvQty = math.floor((riskAmt / (stopDist * tvPointVal)) * 100) / 100
+        
+        // Berechnung für DICH (Broker Lots)
+        float realBrokerQty = math.floor((riskAmt / (stopDist * brokerContract)) * 100) / 100
+        
+        if realBrokerQty >= minLotSize
+            // Wir traden tvQty, loggen aber realBrokerQty
+            logText = "LOTS: " + str.tostring(realBrokerQty)
+            strategy.entry("Long", strategy.long, qty=tvQty, limit=longEntryPrice, comment=logText)
+            strategy.exit("Exit L", "Long", stop=stopLevel, limit=longEntryPrice + (stopDist * rrRatio))
+
+// --- SHORT EXECUTION ---
+if validShort and strategy.position_size == 0
+    float stopLevel = high[1] + syminfo.mintick * 20 // Buffer 20 Ticks
+    float stopDist = stopLevel - shortEntryPrice
+    
+    if stopDist <= maxStopPoints and stopDist > 0
+        float riskAmt = strategy.equity * riskPerTrade
+        float tvQty = math.floor((riskAmt / (stopDist * tvPointVal)) * 100) / 100
+        float realBrokerQty = math.floor((riskAmt / (stopDist * brokerContract)) * 100) / 100
+        
+        if realBrokerQty >= minLotSize
+            logText = "LOTS: " + str.tostring(realBrokerQty)
+            strategy.entry("Short", strategy.short, qty=tvQty, limit=shortEntryPrice, comment=logText)
+            strategy.exit("Exit S", "Short", stop=stopLevel, limit=shortEntryPrice - (stopDist * rrRatio))
+
+// EOD Force Close (Kein Overnight Risk wegen Swap)
+if not inTradeSession and strategy.position_size != 0
+    strategy.close_all(comment="EOD Close")
+
+// ==========================================
+// 5. VISUALS
+// ==========================================
+plot(lastLiqHigh, "Liq High", color.red, 2, plot.style_circles)
+plot(lastLiqLow, "Liq Low", color.green, 2, plot.style_circles)
